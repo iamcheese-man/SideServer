@@ -2,8 +2,8 @@
   "servers": [
     {
       "name": "My Local SideServer",
-      "address": "https://192.168.56.1:6969"
+      "address": "http://192.168.56.1:6969"
     }
   ],
-  "cache": "https://192.168.56.1:6969/servers.hash"
+  "cache": ""
 }
