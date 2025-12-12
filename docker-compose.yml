@@ -1,0 +1,32 @@
+version: '3.5'
+
+services:
+  app:
+    image: sidestore-connect:latest
+    container_name: sidestore-connect
+    restart: unless-stopped
+    ports:
+      - "80:80/tcp"
+    env_file:
+      - ./.env
+    volumes:
+      - './data/storage:/data/storage'
+    networks:
+      - sidestore-connect
+
+  db:
+    image: postgres
+    container_name: sidestore-connect-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: yourpasswordhere
+      POSTGRES_USER: sidestore
+    volumes:
+      - './data/db:/var/lib/postgresql/data'
+    networks:
+      - sidestore-connect
+
+networks:
+  sidestore-connect:
+    name: sidestore-connect
+    driver: bridge
