@@ -1,44 +1,39 @@
 /**
- * SideServer - enhanced
+ * SideServer - HTTP only (no TLS / no self-signed cert)
  *
  * Requirements:
- *   npm install selfsigned bonjour yauzl mime-types
+ *   npm install bonjour yauzl mime-types
  *
  * Notes:
- *   - Requires Node 18+ for global fetch (or install node-fetch and adapt).
- *   - If you have your own cert/key, set TLS_CERT_PATH and TLS_KEY_PATH env vars or update config below.
+ *   - Node 18+ recommended (for global fetch). If using older Node, install node-fetch.
+ *   - Configure via environment variables: IPA_DIR, PORT, DELETE_AFTER_DOWNLOAD, THROTTLE_BYTES_PER_SEC, MIRRORS, MDNS_NAME
  */
 
 const http = require('http');
-const https = require('https');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
-const { pipeline, PassThrough } = require('stream');
-const { Transform } = require('stream');
+const { pipeline, PassThrough, Transform } = require('stream');
 
 // External deps (install via npm)
-const selfsigned = require('selfsigned');
 const bonjour = require('bonjour')();
 const yauzl = require('yauzl');
 const mime = require('mime-types');
 
 // ==== CONFIG ====
-const IPA_DIR = process.env.IPA_DIR || 'E:\\IPAs';
-const DELETE_AFTER_DOWNLOAD = process.env.DELETE_AFTER_DOWNLOAD === 'true' || true;
+const IPA_DIR = process.env.IPA_DIR || 'D:\\IPAs';
+const DELETE_AFTER_DOWNLOAD = (process.env.DELETE_AFTER_DOWNLOAD || 'true') === 'true';
 const THROTTLE_BYTES_PER_SEC = process.env.THROTTLE_BYTES_PER_SEC ? Number(process.env.THROTTLE_BYTES_PER_SEC) : null;
 const PORT = Number(process.env.PORT || 6969);
-const TLS_CERT_PATH = process.env.TLS_CERT_PATH || null; // if provided, uses those files instead of generating
-const TLS_KEY_PATH = process.env.TLS_KEY_PATH || null;
-const MIRROR_BASE_URLS = process.env.MIRRORS ? process.env.MIRRORS.split(',').map(s => s.trim()).filter(Boolean) : []; // e.g. "https://mirror1.example,https://mirror2"
+const MIRROR_BASE_URLS = process.env.MIRRORS ? process.env.MIRRORS.split(',').map(s => s.trim()).filter(Boolean) : [];
 const MDNS_NAME = process.env.MDNS_NAME || 'sideserver';
 const MAX_REPO_ENTRIES = 2000;
 const REPO_SCAN_DEBOUNCE_MS = 300;
 
 // ==== STATE/CACHES ====
 const activeStreams = new Map(); // fileKey -> count
-const shaCache = new Map(); // fileKey -> { mtimeMs, size, sha256 }
+const shaCache = new Map(); // fileKey -> { meta, sha, mtimeMs, size }
 let repoCache = null;
 let lastScan = 0;
 let scanTimer = null;
@@ -79,9 +74,7 @@ function decrementActiveAndMaybeDelete(fileKey, filePath) {
         if (DELETE_AFTER_DOWNLOAD) {
             fsp.unlink(filePath).then(() => {
                 console.log(`Deleted IPA: ${filePath}`);
-                // When file removed, invalidate shaCache entry
                 shaCache.delete(fileKey);
-                // trigger rescan so repo.json reflects removal and redownload attempts can occur later
                 scheduleRepoScan(50);
             }).catch(err => {
                 console.warn(`Failed to delete IPA ${filePath}: ${err.message}`);
@@ -140,7 +133,6 @@ async function computeSha256(filePath) {
         if (cached && cached.meta === metaHashKey && cached.sha) {
             return cached.sha;
         }
-        // Compute new hash
         const hash = crypto.createHash('sha256');
         await new Promise((resolve, reject) => {
             const rs = fs.createReadStream(filePath);
@@ -152,7 +144,6 @@ async function computeSha256(filePath) {
         shaCache.set(key, { meta: metaHashKey, sha, mtimeMs: st.mtimeMs, size: st.size });
         return sha;
     } catch (err) {
-        // missing file or other error
         shaCache.delete(key);
         throw err;
     }
@@ -174,16 +165,13 @@ async function downloadFromMirrors(filename) {
                 console.warn(`Mirror ${url} returned ${res.status}`);
                 continue;
             }
-            // Stream to tmp file
             await fsp.mkdir(path.dirname(tmpPath), { recursive: true });
             const fileStream = fs.createWriteStream(tmpPath, { flags: 'w' });
             await new Promise((resolve, reject) => {
                 pipeline(res.body, fileStream, (err) => err ? reject(err) : resolve());
             });
-            // atomic rename
             await fsp.rename(tmpPath, targetPath);
             console.log(`Downloaded ${filename} from ${base}`);
-            // Invalidate sha cache
             shaCache.delete(path.resolve(targetPath));
             scheduleRepoScan(50);
             return true;
@@ -208,7 +196,6 @@ function parseRangeHeader(range, size) {
     if (typeof end === 'number' && Number.isNaN(end)) end = undefined;
 
     if (typeof start === 'undefined' && typeof end === 'number') {
-        // suffix
         const suffix = end;
         if (suffix === 0) return null;
         start = Math.max(0, size - suffix);
@@ -223,75 +210,6 @@ function parseRangeHeader(range, size) {
 }
 
 // Extract best icon from IPA (zip) and stream it to the response.
-// Returns true if an icon was found and streamed; false if not found.
-function streamIconFromIpa(ipaPath, res) {
-    return new Promise((resolve) => {
-        yauzl.open(ipaPath, { lazyEntries: true }, (err, zipfile) => {
-            if (err) {
-                res.writeHead(500);
-                res.end();
-                return resolve(false);
-            }
-            const iconCandidates = [];
-            zipfile.readEntry();
-            zipfile.on('entry', (entry) => {
-                const name = entry.fileName;
-                // Typical icons live in Payload/*.app/*.png or .jpg
-                if (/\.(png|jpg|jpeg)$/i.test(name) && /\.app\//i.test(name)) {
-                    // Exclude AppIcon60x60@2x~ipad etc? We'll prefer largest file length
-                    iconCandidates.push({ name, size: entry.uncompressedSize });
-                }
-                zipfile.readEntry();
-            });
-            zipfile.on('end', () => {
-                if (iconCandidates.length === 0) {
-                    zipfile.close();
-                    return resolve(false);
-                }
-                // pick largest
-                iconCandidates.sort((a, b) => b.size - a.size);
-                const chosen = iconCandidates[0].name;
-                zipfile.openReadStream(iconCandidates[0].name ? { fileName: chosen } : null, (err2, rs) => {
-                    // Note: yauzl doesn't have openReadStream by name directly. We'll reopen to find the correct entry.
-                    // For compatibility, reopen and iterate
-                    zipfile.close();
-                    yauzl.open(ipaPath, { lazyEntries: true }, (err3, zip2) => {
-                        if (err3) {
-                            res.writeHead(500);
-                            res.end();
-                            return resolve(false);
-                        }
-                        let streamed = false;
-                        zip2.readEntry();
-                        zip2.on('entry', (entry2) => {
-                            if (entry2.fileName === chosen) {
-                                zip2.openReadStream(entry2, (err4, entryStream) => {
-                                    if (err4) {
-                                        zip2.close();
-                                        res.writeHead(500);
-                                        res.end();
-                                        return resolve(false);
-                                    }
-                                    const type = mime.lookup(chosen) || 'application/octet-stream';
-                                    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'public, max-age=86400' });
-                                    pipeline(entryStream, res, (pErr) => {
-                                        zip2.close();
-                                        if (pErr) console.warn('icon stream pipeline err', pErr);
-                                        resolve(true);
-                                    });
-                                });
-                            } else {
-                                zip2.readEntry();
-                            }
-                        });
-                    });
-                });
-            });
-        });
-    });
-}
-
-// More robust icon extraction: iterate entries and stream chosen entry
 function streamIconFromIpa_v2(ipaPath, res) {
     return new Promise((resolve) => {
         yauzl.open(ipaPath, { lazyEntries: true }, (err, zipfile) => {
@@ -347,7 +265,6 @@ async function buildRepoList() {
             try {
                 const stats = await fsp.stat(fullPath);
                 if (!stats.isFile()) continue;
-                // compute sha asynchronously but don't block listing; we'll compute concurrently and attach
                 const item = {
                     name: f,
                     size: stats.size,
@@ -364,7 +281,6 @@ async function buildRepoList() {
         console.error('Failed to read IPA dir for repo.json:', err.message);
     }
 
-    // Compute sha256 concurrently but limit parallelism to avoid I/O overload
     const concurrency = 4;
     let idx = 0;
     const workers = new Array(concurrency).fill(0).map(async () => {
@@ -398,21 +314,17 @@ function scheduleRepoScan(ms = REPO_SCAN_DEBOUNCE_MS) {
     }, ms);
 }
 
-// initial scan (sync)
+// initial scan
 (async () => {
-    try {
-        await fsp.mkdir(IPA_DIR, { recursive: true });
-    } catch (e) { /* ignore */ }
+    try { await fsp.mkdir(IPA_DIR, { recursive: true }); } catch (e) {}
     scheduleRepoScan(10);
 })();
 
-// fs.watch with resilient fallback to polling
 try {
     fs.watch(IPA_DIR, { persistent: true }, (eventType, filename) => {
         if (filename && isIpaFilename(filename)) scheduleRepoScan();
     });
 } catch (e) {
-    // ignore; periodic rescan fallback
     setInterval(() => scheduleRepoScan(), 30_000);
 }
 
@@ -420,7 +332,6 @@ try {
 async function streamFile(filePath, req, res, throttleBytesPerSec) {
     const fileKey = path.resolve(filePath);
 
-    // If file missing, attempt automatic redownload from mirrors (if configured)
     try {
         await fsp.access(filePath, fs.constants.R_OK);
     } catch (err) {
@@ -481,7 +392,6 @@ async function streamFile(filePath, req, res, throttleBytesPerSec) {
 
     incrementActive(fileKey);
 
-    // Zero-copy when no throttling: pipe readStream directly to res (fast)
     const readStream = fs.createReadStream(filePath, { start, end, highWaterMark: 64 * 1024 });
 
     if (!throttleBytesPerSec) {
@@ -504,70 +414,40 @@ async function streamFile(filePath, req, res, throttleBytesPerSec) {
     });
 }
 
-// ==== HTTP(S) SERVER ====
-async function createTlsOptions() {
-    // If paths provided, try to read them
-    if (TLS_CERT_PATH && TLS_KEY_PATH) {
-        try {
-            const cert = await fsp.readFile(TLS_CERT_PATH);
-            const key = await fsp.readFile(TLS_KEY_PATH);
-            return { cert, key };
-        } catch (err) {
-            console.warn('Failed to read provided TLS cert/key:', err.message);
-        }
-    }
-    // generate self-signed cert
-    const attrs = [{ name: 'commonName', value: `${MDNS_NAME}.local` }];
-    const pems = selfsigned.generate(attrs, { days: 365, keySize: 2048, algorithm: 'sha256' });
-    return { cert: pems.cert, key: pems.private };
-}
-
+// ==== HTTP SERVER (NO TLS) ====
 async function startServer() {
     const host = '0.0.0.0';
-    const tls = await createTlsOptions();
-    const httpsServer = https.createServer({ key: tls.key, cert: tls.cert }, requestHandler);
-    const httpServer = http.createServer((req, res) => {
-        // Redirect to https
-        const hostHeader = req.headers.host ? req.headers.host.split(':')[0] : 'localhost';
-        const redirect = `https://${hostHeader}:${PORT}${req.url}`;
-        res.writeHead(301, { Location: redirect });
-        res.end();
+    const server = http.createServer(requestHandler);
+
+    server.listen(PORT, host, () => {
+        console.log(`SideServer (HTTP) running on port ${PORT}`);
+        try {
+            bonjour.publish({ name: MDNS_NAME, type: 'http', port: PORT, txt: { path: '/' } });
+            console.log(`mDNS published as ${MDNS_NAME}.local:${PORT}`);
+        } catch (e) {
+            console.warn('mDNS publish failed', e && e.message ? e.message : e);
+        }
     });
 
-    httpsServer.listen(PORT, host, () => {
-        console.log(`SideServer (HTTPS) running on port ${PORT}`);
-        // mDNS advertise service as https if using TLS
-        bonjour.publish({ name: MDNS_NAME, type: 'https', port: PORT, txt: { path: '/' } });
-        // also publish http for compatibility
-        bonjour.publish({ name: `${MDNS_NAME}-http`, type: 'http', port: PORT, txt: { path: '/' } });
-    });
-
-    httpServer.listen( (PORT === 80) ? 8080 : (PORT + 1), host, () => {
-        console.log(`HTTP redirector running on port ${ (PORT === 80) ? 8080 : (PORT + 1) } -> HTTPS:${PORT}`);
-    });
-
-    // Graceful shutdown handlers
     const stop = () => {
         try { bonjour.unpublishAll(); bonjour.destroy(); } catch (e) {}
-        try { httpsServer.close(); } catch (e) {}
-        try { httpServer.close(); } catch (e) {}
+        try { server.close(); } catch (e) {}
         process.exit(0);
     };
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
 }
 
-// Request handler used for HTTPS server
+// Request handler
 async function requestHandler(req, res) {
     try {
         const hostHeader = req.headers.host || `localhost:${PORT}`;
-        const parsed = new URL(req.url, `https://${hostHeader}`);
+        const parsed = new URL(req.url, `http://${hostHeader}`);
         const pathname = parsed.pathname;
 
         if (pathname === '/repo.json') {
-            // Ensure repoCache is reasonably fresh
             if (!repoCache || (Date.now() - lastScan) > 60_000) {
-                try { repoCache = await buildRepoList(); lastScan = Date.now(); } catch (e) { /* ignore */ }
+                try { repoCache = await buildRepoList(); lastScan = Date.now(); } catch (e) {}
             }
             res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=60' });
             res.end(JSON.stringify(repoCache || []));
@@ -615,7 +495,6 @@ async function requestHandler(req, res) {
                     res.end('Icon not found');
                 }
             } catch (err) {
-                // try mirrors before failing
                 const downloaded = await downloadFromMirrors(decoded);
                 if (downloaded) {
                     const ok = await streamIconFromIpa_v2(ipaPath, res);
@@ -631,7 +510,6 @@ async function requestHandler(req, res) {
             return;
         }
 
-        // health check
         if (pathname === '/.well-known/health' || pathname === '/health') {
             res.writeHead(200, { 'Content-Type': 'text/plain' });
             res.end('ok');
@@ -647,7 +525,7 @@ async function requestHandler(req, res) {
     }
 }
 
-// Start everything
+// Start
 startServer().catch(err => {
     console.error('Failed to start server:', err && err.message ? err.message : err);
     process.exit(1);
