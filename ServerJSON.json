@@ -1,9 +1,9 @@
 {
   "servers": [
     {
-      "name": "My Local SideServer",
-      "address": "http://192.168.56.1:6969"
+      "name": "My SideServer",
+      "address": "http://<server_ip>:6969"
     }
   ],
-  "cache": ""
+  "cache": "your_cache"
 }
