@@ -5,5 +5,5 @@
       "address": "http://<server_ip>:6969"
     }
   ],
-  "cache": "your_cache"
+  "cache": "your_cache_url"
 }
