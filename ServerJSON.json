@@ -5,5 +5,5 @@
       "address": "http(s)://<server_ip>:6969"
     }
   ],
-  "cache": "your_cache_url"
+  "cache": "your_cache_url.json.hash"
 }
