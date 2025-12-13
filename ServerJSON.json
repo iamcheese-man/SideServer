@@ -2,7 +2,7 @@
   "servers": [
     {
       "name": "My SideServer",
-      "address": "http://<server_ip>:6969"
+      "address": "http(s)://<server_ip>:6969"
     }
   ],
   "cache": "your_cache_url"
